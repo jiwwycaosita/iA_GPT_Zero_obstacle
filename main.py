@@ -1,4 +1,12 @@
 # main.py
+# Serveur FastAPI orchestrant des agents Zero Obstacle auto-hébergeables.
+# - Utilise Ollama (HTTP) pour les réponses LLM locales
+# - Agents : extraction PDF, admissibilité, préremplissage, généraliste
+# - Endpoints de démonstration prêts pour WordPress via le plugin fourni
+
+import base64
+import io
+import json
 #
 # Serveur d'agents Zero Obstacle
 # - API FastAPI
@@ -26,6 +34,9 @@ load_dotenv()
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
 
+app = FastAPI(title="Zero Obstacle Agents", version="0.2.0")
+
+# CORS large pour MVP — à restreindre au domaine WordPress ensuite.
 app = FastAPI(title="Zero Obstacle Agents", version="0.1.0")
 
 # CORS (MVP : tout autoriser, à restreindre plus tard)
@@ -72,6 +83,10 @@ class OrchestrationResponse(BaseModel):
 
 async def call_ollama(prompt: str) -> str:
     """
+    Appelle le modèle local via Ollama. Nécessite :
+    - Ollama en cours d'exécution
+    - modèle déjà téléchargé (ex: `ollama pull llama3.1`)
+    """
     Appelle le modèle local via Ollama.
     Nécessite :
       - Ollama en cours d'exécution
@@ -86,6 +101,14 @@ async def call_ollama(prompt: str) -> str:
         "prompt": prompt,
         "stream": False,
     }
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(url, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Erreur Ollama: {exc}") from exc
+    return data.get("response", "").strip()
     async with httpx.AsyncClient(timeout=120) as client:
         response = await client.post(url, json=payload)
         response.raise_for_status()
@@ -124,6 +147,9 @@ async def agent_structure_pdf_form_fields(raw_text: str) -> Dict[str, Any]:
 Tu es un assistant chargé de structurer des formulaires administratifs.
 
 Texte brut du formulaire (extraits PDF) :
+<<<TEXTE_FORMULAIRE>>>
+{raw_text[:6000]}
+<<<FIN_TEXTE_FORMULAIRE>>>
 \"\"\"{raw_text[:6000]}\"\"\"  # limité pour éviter les prompts trop longs
 
 Tâche :
@@ -140,6 +166,30 @@ Tâche :
   "fields": [ ... ]
 }}
 """
+    response = await call_ollama(prompt)
+    try:
+        data = json.loads(response)
+    except json.JSONDecodeError:
+        data = {
+            "fields": [],
+            "raw_response": response,
+        }
+    return data
+
+
+async def agent_admissibility(
+    user_profile: Dict[str, Any], program_rules: List[ProgramRule]
+) -> Dict[str, Any]:
+    """
+    Applique STRICTEMENT les règles fournies. Pas de création de nouvelles règles.
+    Les règles sont purement techniques, pas juridiques.
+    """
+    rules_json = json.dumps([r.dict() for r in program_rules], ensure_ascii=False)
+    profile_json = json.dumps(user_profile, ensure_ascii=False)
+
+    prompt = f"""
+Tu es un système de règles techniques.
+Tu DOIS appliquer UNIQUEMENT les règles fournies ci-dessous.
     llm_response = await call_ollama(prompt)
     import json
 
@@ -191,6 +241,21 @@ Retourne un JSON strictement valide de la forme :
 }}
 """
 
+    response = await call_ollama(prompt)
+    try:
+        data = json.loads(response)
+    except json.JSONDecodeError:
+        data = {
+            "eligible": False,
+            "failed_rules": [],
+            "details": f"Réponse non JSON du modèle : {response}",
+        }
+    return data
+
+
+async def agent_prefill_form(
+    user_profile: Dict[str, Any], fields_schema: Dict[str, Any]
+) -> Dict[str, Any]:
     llm_response = await call_ollama(prompt)
     try:
         eligibility_result = json.loads(llm_response)
@@ -235,6 +300,15 @@ Retour attendu (JSON) :
   }}
 }}
 """
+    response = await call_ollama(prompt)
+    try:
+        data = json.loads(response)
+    except json.JSONDecodeError:
+        data = {
+            "values": {},
+            "details": f"Réponse non JSON du modèle : {response}",
+        }
+    return data
     llm_response = await call_ollama(prompt)
     try:
         prefilled_values = json.loads(llm_response)
@@ -252,16 +326,25 @@ Retour attendu (JSON) :
 
 
 @app.get("/health")
+async def health() -> Dict[str, Any]:
 async def health():
     return {"status": "ok", "model": OLLAMA_MODEL}
 
 
 @app.post("/agent/orchestrate", response_model=OrchestrationResponse)
+async def orchestrate(req: OrchestrationRequest) -> OrchestrationResponse:
 async def orchestrate(request: OrchestrationRequest):
     """
     Endpoint général appelé par WordPress.
     Selon task, route vers l'agent approprié.
     """
+    if req.task == "pdf_extraction":
+        if not req.pdf_base64:
+            raise HTTPException(status_code=400, detail="pdf_base64 manquant")
+        try:
+            pdf_bytes = base64.b64decode(req.pdf_base64)
+        except Exception as exc:  # pragma: no cover - parsing safety
+            raise HTTPException(status_code=400, detail="pdf_base64 invalide") from exc
 
     if request.task == "pdf_extraction":
         if not request.pdf_base64:
@@ -274,6 +357,7 @@ async def orchestrate(request: OrchestrationRequest):
         raw_text = agent_extract_pdf_text(pdf_bytes)
         structured = await agent_structure_pdf_form_fields(raw_text)
         return OrchestrationResponse(
+            task=req.task,
             task=request.task,
             result={
                 "raw_text_preview": raw_text[:2000],
@@ -281,6 +365,32 @@ async def orchestrate(request: OrchestrationRequest):
             },
         )
 
+    if req.task == "admissibility":
+        if not req.user_profile or not req.program_rules:
+            raise HTTPException(
+                status_code=400,
+                detail="user_profile et program_rules sont requis",
+            )
+        result = await agent_admissibility(req.user_profile, req.program_rules)
+        return OrchestrationResponse(task=req.task, result=result)
+
+    if req.task == "prefill":
+        if not req.user_profile or not req.text:
+            raise HTTPException(
+                status_code=400,
+                detail="user_profile et text (schéma) sont requis",
+            )
+        try:
+            fields_schema = json.loads(req.text)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(
+                status_code=400, detail="text doit contenir un JSON de schéma de champs"
+            ) from exc
+        result = await agent_prefill_form(req.user_profile, fields_schema)
+        return OrchestrationResponse(task=req.task, result=result)
+
+    if req.task == "general":
+        if not req.text:
     if request.task == "admissibility":
         if not request.user_profile or not request.program_rules:
             raise HTTPException(status_code=400, detail="user_profile et program_rules sont requis")
@@ -307,6 +417,12 @@ Tu es un assistant Zero Obstacle.
 Réponds de façon structurée, en expliquant clairement les étapes administratives,
 sans inventer de lois ni de droits. Si une information n'est pas disponible, dis-le.
 Question :
+{req.text}
+"""
+        response = await call_ollama(prompt)
+        return OrchestrationResponse(task=req.task, result={"answer": response})
+
+    raise HTTPException(status_code=400, detail=f"Task inconnue: {req.task}")
 {request.text}
 """
         llm_response = await call_ollama(prompt)
@@ -321,6 +437,8 @@ Question :
 
 
 @app.get("/demo/admissibility")
+async def demo_admissibility() -> Dict[str, Any]:
+    """Démo purement technique (non juridique)."""
 async def demo_admissibility():
     """
     Démo purement technique (non juridique).
@@ -351,6 +469,16 @@ async def demo_admissibility():
         ),
     ]
     result = await agent_admissibility(demo_profile, demo_rules)
+    return {
+        "profile": demo_profile,
+        "rules": [r.dict() for r in demo_rules],
+        "result": result,
+    }
+
+
+@app.get("/demo/prefill")
+async def demo_prefill() -> Dict[str, Any]:
+    """Démo de préremplissage sur un schéma fictif."""
     return {"profile": demo_profile, "rules": [rule.dict() for rule in demo_rules], "result": result}
 
 
@@ -375,6 +503,25 @@ async def demo_prefill():
         ]
     }
     result = await agent_prefill_form(demo_profile, fields_schema)
+    return {
+        "profile": demo_profile,
+        "fields_schema": fields_schema,
+        "result": result,
+    }
+
+
+@app.get("/demo/pdf")
+async def demo_pdf_instructions() -> Dict[str, str]:
+    """
+    Rappelle comment utiliser l'endpoint pdf_extraction côté client.
+    """
+    return {
+        "info": "Encodez un PDF en base64 et envoyez-le via POST /agent/orchestrate avec task=pdf_extraction",
+        "example_fields": "pdf_base64, task",
+    }
+
+
+# Point d'entrée de développement local : uvicorn main:app --host 0.0.0.0 --port 8080
     return {"profile": demo_profile, "fields_schema": fields_schema, "result": result}
 
 

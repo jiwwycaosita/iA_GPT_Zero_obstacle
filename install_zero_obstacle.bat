@@ -1,6 +1,9 @@
 @echo off
 setlocal ENABLEDELAYEDEXPANSION
 
+echo === Installation Zero Obstacle Agents (FastAPI + dependances) ===
+
+REM Verifier Python
 echo === Installation Zero Obstacle Agents (FastAPI + dépendances) ===
 
 REM Vérifier Python
