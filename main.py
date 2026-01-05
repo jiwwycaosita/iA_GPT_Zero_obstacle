@@ -7,6 +7,17 @@
 import base64
 import io
 import json
+#
+# Serveur d'agents Zero Obstacle
+# - API FastAPI
+# - Intégration Ollama
+# - Agents : orchestrateur, PDF, admissibilité, préremplissage
+#
+# Dépendances :
+#   pip install fastapi uvicorn[standard] httpx pydantic pypdf python-dotenv
+
+import base64
+import io
 import os
 from typing import Any, Dict, List, Optional
 
@@ -17,6 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pypdf import PdfReader
 
+# Charger .env si présent (OLLAMA_URL, OLLAMA_MODEL)
 load_dotenv()
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
@@ -25,6 +37,9 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
 app = FastAPI(title="Zero Obstacle Agents", version="0.2.0")
 
 # CORS large pour MVP — à restreindre au domaine WordPress ensuite.
+app = FastAPI(title="Zero Obstacle Agents", version="0.1.0")
+
+# CORS (MVP : tout autoriser, à restreindre plus tard)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -72,6 +87,14 @@ async def call_ollama(prompt: str) -> str:
     - Ollama en cours d'exécution
     - modèle déjà téléchargé (ex: `ollama pull llama3.1`)
     """
+    Appelle le modèle local via Ollama.
+    Nécessite :
+      - Ollama en cours d'exécution
+      - modèle tiré (ollama pull ...)
+
+    L'API utilisée est la génération simple (non streaming).
+    """
+
     url = f"{OLLAMA_URL}/api/generate"
     payload = {
         "model": OLLAMA_MODEL,
@@ -86,6 +109,11 @@ async def call_ollama(prompt: str) -> str:
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"Erreur Ollama: {exc}") from exc
     return data.get("response", "").strip()
+    async with httpx.AsyncClient(timeout=120) as client:
+        response = await client.post(url, json=payload)
+        response.raise_for_status()
+        response_data = response.json()
+    return response_data.get("response", "").strip()
 
 
 # =========================
@@ -98,6 +126,7 @@ def agent_extract_pdf_text(pdf_bytes: bytes) -> str:
     Extraction brute du texte d'un PDF avec pypdf.
     Ne fait aucune interprétation juridique : seulement du texte.
     """
+
     reader = PdfReader(io.BytesIO(pdf_bytes))
     text_chunks: List[str] = []
     for page in reader.pages:
@@ -113,6 +142,7 @@ async def agent_structure_pdf_form_fields(raw_text: str) -> Dict[str, Any]:
     Demande au LLM de transformer un texte brut de formulaire
     en liste structurée de champs (MVP).
     """
+
     prompt = f"""
 Tu es un assistant chargé de structurer des formulaires administratifs.
 
@@ -120,6 +150,7 @@ Texte brut du formulaire (extraits PDF) :
 <<<TEXTE_FORMULAIRE>>>
 {raw_text[:6000]}
 <<<FIN_TEXTE_FORMULAIRE>>>
+\"\"\"{raw_text[:6000]}\"\"\"  # limité pour éviter les prompts trop longs
 
 Tâche :
 1. Identifie les champs du formulaire (ex: nom, prénom, NAS, adresse, etc.).
@@ -159,6 +190,34 @@ async def agent_admissibility(
     prompt = f"""
 Tu es un système de règles techniques.
 Tu DOIS appliquer UNIQUEMENT les règles fournies ci-dessous.
+    llm_response = await call_ollama(prompt)
+    import json
+
+    try:
+        structured_data = json.loads(llm_response)
+    except Exception:
+        structured_data = {
+            "fields": [],
+            "raw_response": llm_response,
+        }
+    return structured_data
+
+
+async def agent_admissibility(user_profile: Dict[str, Any], program_rules: List[ProgramRule]) -> Dict[str, Any]:
+    """
+    Applique STRICTEMENT les règles fournies.
+    Pas de création de nouvelles règles.
+    Les règles sont purement techniques, pas juridiques.
+    """
+
+    import json
+
+    rules_json = json.dumps([rule.dict() for rule in program_rules], ensure_ascii=False)
+    profile_json = json.dumps(user_profile, ensure_ascii=False)
+
+    prompt = f"""
+Tu es un système de règles techniques. 
+Tu DOIS appliquer UNIQUEMENT les règles fournies ci-dessous. 
 Tu NE DOIS PAS inventer de nouvelles conditions.
 
 Règles (JSON) :
@@ -197,10 +256,26 @@ Retourne un JSON strictement valide de la forme :
 async def agent_prefill_form(
     user_profile: Dict[str, Any], fields_schema: Dict[str, Any]
 ) -> Dict[str, Any]:
+    llm_response = await call_ollama(prompt)
+    try:
+        eligibility_result = json.loads(llm_response)
+    except Exception:
+        eligibility_result = {
+            "eligible": False,
+            "failed_rules": [],
+            "details": f"Réponse non JSON du modèle : {llm_response}",
+        }
+    return eligibility_result
+
+
+async def agent_prefill_form(user_profile: Dict[str, Any], fields_schema: Dict[str, Any]) -> Dict[str, Any]:
     """
     Propose un préremplissage strictement basé sur les données du profil.
     Ne devine pas des informations absentes.
     """
+
+    import json
+
     fields_json = json.dumps(fields_schema, ensure_ascii=False)
     profile_json = json.dumps(user_profile, ensure_ascii=False)
 
@@ -234,6 +309,15 @@ Retour attendu (JSON) :
             "details": f"Réponse non JSON du modèle : {response}",
         }
     return data
+    llm_response = await call_ollama(prompt)
+    try:
+        prefilled_values = json.loads(llm_response)
+    except Exception:
+        prefilled_values = {
+            "values": {},
+            "details": f"Réponse non JSON du modèle : {llm_response}",
+        }
+    return prefilled_values
 
 
 # =========================
@@ -243,11 +327,13 @@ Retour attendu (JSON) :
 
 @app.get("/health")
 async def health() -> Dict[str, Any]:
+async def health():
     return {"status": "ok", "model": OLLAMA_MODEL}
 
 
 @app.post("/agent/orchestrate", response_model=OrchestrationResponse)
 async def orchestrate(req: OrchestrationRequest) -> OrchestrationResponse:
+async def orchestrate(request: OrchestrationRequest):
     """
     Endpoint général appelé par WordPress.
     Selon task, route vers l'agent approprié.
@@ -260,10 +346,19 @@ async def orchestrate(req: OrchestrationRequest) -> OrchestrationResponse:
         except Exception as exc:  # pragma: no cover - parsing safety
             raise HTTPException(status_code=400, detail="pdf_base64 invalide") from exc
 
+    if request.task == "pdf_extraction":
+        if not request.pdf_base64:
+            raise HTTPException(status_code=400, detail="pdf_base64 manquant")
+        try:
+            pdf_bytes = base64.b64decode(request.pdf_base64)
+        except Exception:
+            raise HTTPException(status_code=400, detail="pdf_base64 invalide")
+
         raw_text = agent_extract_pdf_text(pdf_bytes)
         structured = await agent_structure_pdf_form_fields(raw_text)
         return OrchestrationResponse(
             task=req.task,
+            task=request.task,
             result={
                 "raw_text_preview": raw_text[:2000],
                 "structured": structured,
@@ -296,6 +391,26 @@ async def orchestrate(req: OrchestrationRequest) -> OrchestrationResponse:
 
     if req.task == "general":
         if not req.text:
+    if request.task == "admissibility":
+        if not request.user_profile or not request.program_rules:
+            raise HTTPException(status_code=400, detail="user_profile et program_rules sont requis")
+        result = await agent_admissibility(request.user_profile, request.program_rules)
+        return OrchestrationResponse(task=request.task, result=result)
+
+    if request.task == "prefill":
+        if not request.user_profile or not request.text:
+            raise HTTPException(status_code=400, detail="user_profile et text (schéma) sont requis")
+        import json
+
+        try:
+            fields_schema = json.loads(request.text)
+        except Exception:
+            raise HTTPException(status_code=400, detail="text doit contenir un JSON de schéma de champs")
+        result = await agent_prefill_form(request.user_profile, fields_schema)
+        return OrchestrationResponse(task=request.task, result=result)
+
+    if request.task == "general":
+        if not request.text:
             raise HTTPException(status_code=400, detail="text manquant pour task=general")
         prompt = f"""
 Tu es un assistant Zero Obstacle.
@@ -308,6 +423,12 @@ Question :
         return OrchestrationResponse(task=req.task, result={"answer": response})
 
     raise HTTPException(status_code=400, detail=f"Task inconnue: {req.task}")
+{request.text}
+"""
+        llm_response = await call_ollama(prompt)
+        return OrchestrationResponse(task=request.task, result={"answer": llm_response})
+
+    raise HTTPException(status_code=400, detail=f"Task inconnue: {request.task}")
 
 
 # =========================
@@ -318,6 +439,11 @@ Question :
 @app.get("/demo/admissibility")
 async def demo_admissibility() -> Dict[str, Any]:
     """Démo purement technique (non juridique)."""
+async def demo_admissibility():
+    """
+    Démo purement technique (non juridique).
+    """
+
     demo_profile = {
         "province": "QC",
         "age": 35,
@@ -353,6 +479,15 @@ async def demo_admissibility() -> Dict[str, Any]:
 @app.get("/demo/prefill")
 async def demo_prefill() -> Dict[str, Any]:
     """Démo de préremplissage sur un schéma fictif."""
+    return {"profile": demo_profile, "rules": [rule.dict() for rule in demo_rules], "result": result}
+
+
+@app.get("/demo/prefill")
+async def demo_prefill():
+    """
+    Démo de préremplissage sur un schéma fictif.
+    """
+
     demo_profile = {
         "first_name": "Alex",
         "last_name": "Tremblay",
@@ -387,3 +522,10 @@ async def demo_pdf_instructions() -> Dict[str, str]:
 
 
 # Point d'entrée de développement local : uvicorn main:app --host 0.0.0.0 --port 8080
+    return {"profile": demo_profile, "fields_schema": fields_schema, "result": result}
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("main:app", host="0.0.0.0", port=8080, reload=True)

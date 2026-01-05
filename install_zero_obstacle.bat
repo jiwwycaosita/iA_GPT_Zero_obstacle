@@ -4,6 +4,9 @@ setlocal ENABLEDELAYEDEXPANSION
 echo === Installation Zero Obstacle Agents (FastAPI + dependances) ===
 
 REM Verifier Python
+echo === Installation Zero Obstacle Agents (FastAPI + dépendances) ===
+
+REM Vérifier Python
 where python >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
     echo Python non detecte. Installation via winget...
