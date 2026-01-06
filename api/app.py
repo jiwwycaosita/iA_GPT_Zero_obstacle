@@ -24,5 +24,5 @@ async def enqueue_job(job_request: AddJobRequest) -> dict:
     if not os.getenv("REDIS_URL"):
         raise HTTPException(status_code=500, detail="Missing REDIS_URL configuration")
 
-    task = add.delay(job_request.first_number, job_request.second_number)
-    return {"task_id": task.id, "status": "queued"}
+    addition_task = add.delay(job_request.first_number, job_request.second_number)
+    return {"task_id": addition_task.id, "status": "queued"}
