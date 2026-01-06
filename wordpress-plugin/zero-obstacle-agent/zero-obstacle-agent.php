@@ -48,33 +48,33 @@ function zoa_options_page() {
 function zoa_form_shortcode() {
     $api_url = esc_url(get_option('zoa_api_url'));
 
-    $output = '';
+    $form_output = '';
 
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['zoa_question']) && check_admin_referer('zoa_form_action', 'zoa_form_nonce')) {
-        $question = sanitize_textarea_field($_POST['zoa_question']);
+        $user_question = sanitize_textarea_field($_POST['zoa_question']);
 
-        $body = wp_json_encode(array(
+        $api_request_body = wp_json_encode(array(
             'task' => 'general',
-            'text' => $question,
+            'text' => $user_question,
         ));
 
-        $response = wp_remote_post(rtrim($api_url, '/') . '/agent/orchestrate', array(
+        $api_response = wp_remote_post(rtrim($api_url, '/') . '/agent/orchestrate', array(
             'headers' => array('Content-Type' => 'application/json'),
-            'body'    => $body,
+            'body'    => $api_request_body,
             'timeout' => 60,
         ));
 
-        if (is_wp_error($response)) {
-            $output .= '<div style="color:red;">Erreur de connexion à l’agent : ' . esc_html($response->get_error_message()) . '</div>';
+        if (is_wp_error($api_response)) {
+            $form_output .= '<div style="color:red;">Erreur de connexion à l’agent : ' . esc_html($api_response->get_error_message()) . '</div>';
         } else {
-            $status_code = wp_remote_retrieve_response_code($response);
-            $response_body = wp_remote_retrieve_body($response);
-            if ($status_code === 200) {
-                $data = json_decode($response_body, true);
-                $answer = isset($data['result']['answer']) ? esc_html($data['result']['answer']) : 'Aucune réponse.';
-                $output .= '<h3>Réponse de l’agent :</h3><pre style="white-space:pre-wrap;">' . $answer . '</pre>';
+            $http_status_code = wp_remote_retrieve_response_code($api_response);
+            $api_response_body = wp_remote_retrieve_body($api_response);
+            if ($http_status_code === 200) {
+                $response_data = json_decode($api_response_body, true);
+                $agent_answer = isset($response_data['result']['answer']) ? esc_html($response_data['result']['answer']) : 'Aucune réponse.';
+                $form_output .= '<h3>Réponse de l’agent :</h3><pre style="white-space:pre-wrap;">' . $agent_answer . '</pre>';
             } else {
-                $output .= '<div style="color:red;">Erreur API (' . intval($status_code) . ') : ' . esc_html($response_body) . '</div>';
+                $form_output .= '<div style="color:red;">Erreur API (' . intval($http_status_code) . ') : ' . esc_html($api_response_body) . '</div>';
             }
         }
     }
@@ -94,6 +94,6 @@ function zoa_form_shortcode() {
     <?php
     $form_html = ob_get_clean();
 
-    return $output . $form_html;
+    return $form_output . $form_html;
 }
 add_shortcode('zero_obstacle_form', 'zoa_form_shortcode');

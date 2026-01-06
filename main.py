@@ -80,17 +80,17 @@ async def call_ollama(prompt: str) -> str:
     L'API utilisée est la génération simple (non streaming).
     """
 
-    url = f"{OLLAMA_URL}/api/generate"
-    payload = {
+    ollama_api_url = f"{OLLAMA_URL}/api/generate"
+    generation_payload = {
         "model": OLLAMA_MODEL,
         "prompt": prompt,
         "stream": False,
     }
-    async with httpx.AsyncClient(timeout=120) as client:
-        response = await client.post(url, json=payload)
-        response.raise_for_status()
-        response_data = response.json()
-    return response_data.get("response", "").strip()
+    async with httpx.AsyncClient(timeout=120) as http_client:
+        ollama_response = await http_client.post(ollama_api_url, json=generation_payload)
+        ollama_response.raise_for_status()
+        response_json = ollama_response.json()
+    return response_json.get("response", "").strip()
 
 
 # =========================
@@ -104,14 +104,14 @@ def agent_extract_pdf_text(pdf_bytes: bytes) -> str:
     Ne fait aucune interprétation juridique : seulement du texte.
     """
 
-    reader = PdfReader(io.BytesIO(pdf_bytes))
-    text_chunks: List[str] = []
-    for page in reader.pages:
+    pdf_reader = PdfReader(io.BytesIO(pdf_bytes))
+    extracted_text_chunks: List[str] = []
+    for pdf_page in pdf_reader.pages:
         try:
-            text_chunks.append(page.extract_text() or "")
+            extracted_text_chunks.append(pdf_page.extract_text() or "")
         except Exception:
             continue
-    return "\n\n".join(text_chunks)
+    return "\n\n".join(extracted_text_chunks)
 
 
 async def agent_structure_pdf_form_fields(raw_text: str) -> Dict[str, Any]:
@@ -120,7 +120,7 @@ async def agent_structure_pdf_form_fields(raw_text: str) -> Dict[str, Any]:
     en liste structurée de champs (MVP).
     """
 
-    prompt = f"""
+    structure_prompt = f"""
 Tu es un assistant chargé de structurer des formulaires administratifs.
 
 Texte brut du formulaire (extraits PDF) :
@@ -140,17 +140,17 @@ Tâche :
   "fields": [ ... ]
 }}
 """
-    llm_response = await call_ollama(prompt)
+    llm_response = await call_ollama(structure_prompt)
     import json
 
     try:
-        structured_data = json.loads(llm_response)
+        parsed_structured_data = json.loads(llm_response)
     except Exception:
-        structured_data = {
+        parsed_structured_data = {
             "fields": [],
             "raw_response": llm_response,
         }
-    return structured_data
+    return parsed_structured_data
 
 
 async def agent_admissibility(user_profile: Dict[str, Any], program_rules: List[ProgramRule]) -> Dict[str, Any]:
@@ -162,19 +162,19 @@ async def agent_admissibility(user_profile: Dict[str, Any], program_rules: List[
 
     import json
 
-    rules_json = json.dumps([rule.dict() for rule in program_rules], ensure_ascii=False)
-    profile_json = json.dumps(user_profile, ensure_ascii=False)
+    serialized_rules_json = json.dumps([rule.dict() for rule in program_rules], ensure_ascii=False)
+    serialized_profile_json = json.dumps(user_profile, ensure_ascii=False)
 
-    prompt = f"""
+    eligibility_check_prompt = f"""
 Tu es un système de règles techniques. 
 Tu DOIS appliquer UNIQUEMENT les règles fournies ci-dessous. 
 Tu NE DOIS PAS inventer de nouvelles conditions.
 
 Règles (JSON) :
-{rules_json}
+{serialized_rules_json}
 
 Profil utilisateur (JSON) :
-{profile_json}
+{serialized_profile_json}
 
 Tâche :
 1. Pour chaque règle, indique si elle est satisfaite ou non.
@@ -191,16 +191,16 @@ Retourne un JSON strictement valide de la forme :
 }}
 """
 
-    llm_response = await call_ollama(prompt)
+    llm_response = await call_ollama(eligibility_check_prompt)
     try:
-        eligibility_result = json.loads(llm_response)
+        parsed_eligibility_result = json.loads(llm_response)
     except Exception:
-        eligibility_result = {
+        parsed_eligibility_result = {
             "eligible": False,
             "failed_rules": [],
             "details": f"Réponse non JSON du modèle : {llm_response}",
         }
-    return eligibility_result
+    return parsed_eligibility_result
 
 
 async def agent_prefill_form(user_profile: Dict[str, Any], fields_schema: Dict[str, Any]) -> Dict[str, Any]:
@@ -211,17 +211,17 @@ async def agent_prefill_form(user_profile: Dict[str, Any], fields_schema: Dict[s
 
     import json
 
-    fields_json = json.dumps(fields_schema, ensure_ascii=False)
-    profile_json = json.dumps(user_profile, ensure_ascii=False)
+    serialized_fields_json = json.dumps(fields_schema, ensure_ascii=False)
+    serialized_profile_json = json.dumps(user_profile, ensure_ascii=False)
 
-    prompt = f"""
+    prefill_prompt = f"""
 Tu dois préremplir un formulaire à partir d'un profil utilisateur.
 
 Schéma des champs :
-{fields_json}
+{serialized_fields_json}
 
 Profil utilisateur :
-{profile_json}
+{serialized_profile_json}
 
 Règles :
 - Tu n'inventes aucune information.
@@ -235,15 +235,15 @@ Retour attendu (JSON) :
   }}
 }}
 """
-    llm_response = await call_ollama(prompt)
+    llm_response = await call_ollama(prefill_prompt)
     try:
-        prefilled_values = json.loads(llm_response)
+        parsed_prefilled_values = json.loads(llm_response)
     except Exception:
-        prefilled_values = {
+        parsed_prefilled_values = {
             "values": {},
             "details": f"Réponse non JSON du modèle : {llm_response}",
         }
-    return prefilled_values
+    return parsed_prefilled_values
 
 
 # =========================
@@ -267,25 +267,25 @@ async def orchestrate(request: OrchestrationRequest):
         if not request.pdf_base64:
             raise HTTPException(status_code=400, detail="pdf_base64 manquant")
         try:
-            pdf_bytes = base64.b64decode(request.pdf_base64)
+            decoded_pdf_bytes = base64.b64decode(request.pdf_base64)
         except Exception:
             raise HTTPException(status_code=400, detail="pdf_base64 invalide")
 
-        raw_text = agent_extract_pdf_text(pdf_bytes)
-        structured = await agent_structure_pdf_form_fields(raw_text)
+        extracted_raw_text = agent_extract_pdf_text(decoded_pdf_bytes)
+        structured_fields = await agent_structure_pdf_form_fields(extracted_raw_text)
         return OrchestrationResponse(
             task=request.task,
             result={
-                "raw_text_preview": raw_text[:2000],
-                "structured": structured,
+                "raw_text_preview": extracted_raw_text[:2000],
+                "structured": structured_fields,
             },
         )
 
     if request.task == "admissibility":
         if not request.user_profile or not request.program_rules:
             raise HTTPException(status_code=400, detail="user_profile et program_rules sont requis")
-        result = await agent_admissibility(request.user_profile, request.program_rules)
-        return OrchestrationResponse(task=request.task, result=result)
+        eligibility_result = await agent_admissibility(request.user_profile, request.program_rules)
+        return OrchestrationResponse(task=request.task, result=eligibility_result)
 
     if request.task == "prefill":
         if not request.user_profile or not request.text:
@@ -293,24 +293,24 @@ async def orchestrate(request: OrchestrationRequest):
         import json
 
         try:
-            fields_schema = json.loads(request.text)
+            parsed_fields_schema = json.loads(request.text)
         except Exception:
             raise HTTPException(status_code=400, detail="text doit contenir un JSON de schéma de champs")
-        result = await agent_prefill_form(request.user_profile, fields_schema)
-        return OrchestrationResponse(task=request.task, result=result)
+        prefill_result = await agent_prefill_form(request.user_profile, parsed_fields_schema)
+        return OrchestrationResponse(task=request.task, result=prefill_result)
 
     if request.task == "general":
         if not request.text:
             raise HTTPException(status_code=400, detail="text manquant pour task=general")
-        prompt = f"""
+        general_question_prompt = f"""
 Tu es un assistant Zero Obstacle.
 Réponds de façon structurée, en expliquant clairement les étapes administratives,
 sans inventer de lois ni de droits. Si une information n'est pas disponible, dis-le.
 Question :
 {request.text}
 """
-        llm_response = await call_ollama(prompt)
-        return OrchestrationResponse(task=request.task, result={"answer": llm_response})
+        general_answer = await call_ollama(general_question_prompt)
+        return OrchestrationResponse(task=request.task, result={"answer": general_answer})
 
     raise HTTPException(status_code=400, detail=f"Task inconnue: {request.task}")
 
@@ -326,13 +326,13 @@ async def demo_admissibility():
     Démo purement technique (non juridique).
     """
 
-    demo_profile = {
+    demo_user_profile = {
         "province": "QC",
         "age": 35,
         "income": 25000,
         "single_parent": True,
     }
-    demo_rules = [
+    demo_program_rules = [
         ProgramRule(
             id="age_min_18",
             description="Âge minimum 18 ans",
@@ -350,8 +350,8 @@ async def demo_admissibility():
             required=True,
         ),
     ]
-    result = await agent_admissibility(demo_profile, demo_rules)
-    return {"profile": demo_profile, "rules": [rule.dict() for rule in demo_rules], "result": result}
+    eligibility_check_result = await agent_admissibility(demo_user_profile, demo_program_rules)
+    return {"profile": demo_user_profile, "rules": [rule.dict() for rule in demo_program_rules], "result": eligibility_check_result}
 
 
 @app.get("/demo/prefill")
@@ -360,13 +360,13 @@ async def demo_prefill():
     Démo de préremplissage sur un schéma fictif.
     """
 
-    demo_profile = {
+    demo_user_profile = {
         "first_name": "Alex",
         "last_name": "Tremblay",
         "province": "QC",
         "email": "alex.tremblay@example.com",
     }
-    fields_schema = {
+    demo_fields_schema = {
         "fields": [
             {"name": "first_name", "label": "Prénom", "type": "string", "required": True},
             {"name": "last_name", "label": "Nom", "type": "string", "required": True},
@@ -374,8 +374,8 @@ async def demo_prefill():
             {"name": "phone", "label": "Téléphone", "type": "string", "required": False},
         ]
     }
-    result = await agent_prefill_form(demo_profile, fields_schema)
-    return {"profile": demo_profile, "fields_schema": fields_schema, "result": result}
+    prefill_result = await agent_prefill_form(demo_user_profile, demo_fields_schema)
+    return {"profile": demo_user_profile, "fields_schema": demo_fields_schema, "result": prefill_result}
 
 
 if __name__ == "__main__":
