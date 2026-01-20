@@ -5,14 +5,16 @@ This MVP is fully self-hostable and designed to run locally with Ollama.
 import os
 import base64
 import io
-from typing import Optional, List, Dict, Any, Callable
+from typing import Optional, List, Dict, Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from pypdf import PdfReader
 import httpx
 from dotenv import load_dotenv
+from pydantic import BaseModel
+from pypdf import PdfReader
+
+from app.admissibility_core import evaluate_rules
 
 # Load environment variables from .env if present
 load_dotenv()
@@ -126,42 +128,6 @@ Tâche :
     return data
 
 
-def _get_profile_value(profile: Dict[str, Any], field_path: str) -> Any:
-    current: Any = profile
-    for part in field_path.split('.'):
-        if isinstance(current, dict) and part in current:
-            current = current[part]
-        else:
-            return None
-    return current
-
-
-def _operator_matches(value: Any, operator: str, expected: Any) -> bool:
-    ops: Dict[str, Callable[[Any, Any], bool]] = {
-        "==": lambda a, b: a == b,
-        "=": lambda a, b: a == b,
-        "eq": lambda a, b: a == b,
-        "!=": lambda a, b: a != b,
-        "neq": lambda a, b: a != b,
-        ">": lambda a, b: isinstance(a, (int, float)) and a > b,
-        ">=": lambda a, b: isinstance(a, (int, float)) and a >= b,
-        "<": lambda a, b: isinstance(a, (int, float)) and a < b,
-        "<=": lambda a, b: isinstance(a, (int, float)) and a <= b,
-        "in": lambda a, b: a in b if isinstance(b, (list, tuple, set)) else False,
-        "not_in": lambda a, b: a not in b if isinstance(b, (list, tuple, set)) else False,
-        "exists": lambda a, _: a is not None,
-        "not_exists": lambda a, _: a is None,
-    }
-
-    matcher = ops.get(operator.lower()) if isinstance(operator, str) else None
-    if not matcher:
-        return False
-    try:
-        return matcher(value, expected)
-    except Exception:
-        return False
-
-
 async def agent_admissibility(user_profile: Dict[str, Any], program_rules: List[ProgramRule]) -> Dict[str, Any]:
     """
     Apply ONLY the supplied rules without creating new conditions.
@@ -171,35 +137,8 @@ async def agent_admissibility(user_profile: Dict[str, Any], program_rules: List[
     exists, not_exists. Numerical comparisons require the user value to be a
     number; otherwise the rule fails.
     """
-
-    results: List[Dict[str, Any]] = []
-    failed_rules: List[str] = []
-
-    for rule in program_rules:
-        value = _get_profile_value(user_profile, rule.field)
-        passed = _operator_matches(value, rule.operator, rule.value)
-        if not passed and rule.required:
-            failed_rules.append(rule.id)
-        results.append(
-            {
-                "id": rule.id,
-                "field": rule.field,
-                "operator": rule.operator,
-                "expected": rule.value,
-                "value": value,
-                "required": rule.required,
-                "passed": passed,
-            }
-        )
-
-    eligible = len([r for r in program_rules if r.required]) == 0 or len(failed_rules) == 0
-
-    return {
-        "eligible": eligible,
-        "failed_rules": failed_rules,
-        "details": "Calcul local sans LLM; les règles non satisfaites sont listées.",
-        "rule_results": results,
-    }
+    rule_dicts = [rule.dict() for rule in program_rules]
+    return evaluate_rules(user_profile, rule_dicts)
 
 
 async def agent_prefill_form(user_profile: Dict[str, Any], fields_schema: Dict[str, Any]) -> Dict[str, Any]:
