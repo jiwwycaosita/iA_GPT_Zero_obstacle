@@ -28,6 +28,6 @@ class OpenAIClient:
 
         response = self.client.responses.create(
             model=self.model,
-            input=[{"role": "user", "content": prompt}],
+            input=prompt,
         )
         return response.output[0].content[0].text
